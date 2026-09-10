@@ -15,7 +15,28 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y openssh-server curl
+          sudo apt-get install -y openssh-server curl git zstd openssl
+      - name: Restore latest ReVBS system snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVBS_BACKUP_KEY: ${{ secrets.REVBS_BACKUP_KEY }}
+        run: |
+          set -euo pipefail
+          BACKUP_DIR="$(mktemp -d)"
+          if git clone --depth 1 --branch revbs-backup "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BACKUP_DIR/repo" 2>/dev/null; then
+            if [[ -s "$BACKUP_DIR/repo/backups/system-latest.tar.zst.enc" ]]; then
+              echo 'Restoring latest ReVBS snapshot...'
+              printf '%s' "$REVBS_BACKUP_KEY" | sudo tee "$BACKUP_DIR/key" >/dev/null
+              sudo chmod 600 "$BACKUP_DIR/key"
+              sudo sh -c "openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass file='$BACKUP_DIR/key' -in '$BACKUP_DIR/repo/backups/system-latest.tar.zst.enc' | zstd -d | tar --extract --absolute-names --preserve-permissions --same-owner -C /"
+              echo 'ReVBS snapshot restored.'
+            else
+              echo 'No ReVBS snapshot found; starting from a clean runner.'
+            fi
+          else
+            echo 'No revbs-backup branch found; starting from a clean runner.'
+          fi
+          rm -rf "$BACKUP_DIR"
       - name: Configure OpenSSH
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
@@ -71,8 +92,47 @@ jobs:
           echo "Listening ports:"
           ss -lnt
       - name: Keep SSH runner alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVBS_BACKUP_KEY: ${{ secrets.REVBS_BACKUP_KEY }}
         run: |
+          set -euo pipefail
+          backup_once() {
+            work="$(mktemp -d)"
+            sudo tar --create --zstd --file "$work/system.tar.zst" \
+              --absolute-names --ignore-failed-read --warning=no-file-changed \
+              --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+              --exclude=/tmp --exclude=/var/tmp --exclude=/var/cache/apt \
+              --exclude=/var/lib/apt/lists --exclude=/home/runner/.cache \
+              --exclude=/home/runner/.git --exclude=/home/runner/work \
+              --exclude=/home/runner/_work --exclude=/tmp/* /
+            openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+              -pass env:REVBS_BACKUP_KEY -in "$work/system.tar.zst" \
+              -out "$work/system-latest.tar.zst.enc"
+            size="$(stat -c '%s' "$work/system-latest.tar.zst.enc")"
+            if (( size > 70000000 )); then
+              echo "ReVBS backup is ${size} bytes; refusing upload above 70 MB."
+              rm -rf "$work"
+              return 1
+            fi
+            mkdir -p "$work/repo/backups"
+            cp "$work/system-latest.tar.zst.enc" "$work/repo/backups/system-latest.tar.zst.enc"
+            printf '{\"run_id\":\"%s\",\"created_at\":\"%s\",\"bytes\":%s,\"format\":\"tar.zst.enc\",\"scope\":\"practical-system\"}\n' \
+              "$GITHUB_RUN_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$size" > "$work/repo/backups/checkpoint.json"
+            cd "$work/repo"
+            git init -q -b revbs-backup
+            git config user.name 'ReVBS Backup'
+            git config user.email 'revbs-backup@users.noreply.github.com'
+            git add backups
+            git commit -qm "ReVBS snapshot ${GITHUB_RUN_ID}"
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push -q origin HEAD:refs/heads/revbs-backup --force
+            rm -rf "$work"
+            echo "ReVBS backup updated: ${size} bytes"
+          }
+          backup_once || echo 'Initial ReVBS backup failed; retrying in 10 minutes.'
           while true; do
             echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] SSH runner alive at $TAILSCALE_IP"
-            sleep 60
+            sleep 600
+            backup_once || echo 'ReVBS backup attempt failed; the SSH runner will continue.'
           done
