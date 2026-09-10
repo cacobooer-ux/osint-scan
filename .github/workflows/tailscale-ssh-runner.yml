@@ -1,0 +1,78 @@
+name: Ubuntu Tailscale SSH Runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ubuntu-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install OpenSSH server and tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server curl
+      - name: Configure OpenSSH
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo install -d -m 700 -o runner -g runner /home/runner/.ssh
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
+          sudo chown runner:runner /home/runner/.ssh/authorized_keys
+          sudo chmod 600 /home/runner/.ssh/authorized_keys
+          printf 'runner:%s\n' "$SSH_PASSWORD" | sudo chpasswd
+          printf '%s\n' 'PasswordAuthentication yes' | sudo tee /etc/ssh/sshd_config.d/runner-password.conf >/dev/null
+          printf '%s\n' 'PubkeyAuthentication yes' | sudo tee -a /etc/ssh/sshd_config.d/runner-password.conf >/dev/null
+          sudo install -d -m 0755 /run/sshd
+          sudo sshd -t
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+      - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="gh-ubuntu-${GITHUB_RUN_ID}"
+          IP="$(tailscale ip -4 | head -n1)"
+          echo "TAILSCALE_IP=$IP" >> "$GITHUB_ENV"
+          echo "SSH_COMMAND=ssh runner@$IP" >> "$GITHUB_ENV"
+          echo "========================================"
+          echo "TAILSCALE_IP=$IP"
+          echo "SSH_COMMAND=ssh runner@$IP"
+          echo "========================================"
+      - name: Publish runner connection status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          STATUS="RUN_ID=$GITHUB_RUN_ID\nTAILSCALE_IP=$TAILSCALE_IP\nSSH_COMMAND=ssh runner@$TAILSCALE_IP\nSTATUS=ready\n"
+          CONTENT="$(printf '%b' "$STATUS" | base64 -w 0)"
+          curl -fsSL -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/.github/runner-status/$GITHUB_RUN_ID.txt" \
+            -d "{\"message\":\"Publish runner connection status\",\"content\":\"$CONTENT\"}"
+      - name: Show runner status
+        run: |
+          set -e
+          echo "Runner: $(whoami)"
+          echo "Hostname: $(hostname)"
+          echo "SSH service:"
+          sudo systemctl --no-pager --full status ssh || true
+          echo "Listening ports:"
+          ss -lnt
+      - name: Keep SSH runner alive
+        run: |
+          while true; do
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] SSH runner alive at $TAILSCALE_IP"
+            sleep 60
+          done
